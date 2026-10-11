@@ -32,7 +32,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("publicador")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-TOKEN = os.environ.get("1700944919:AAE6NFOgD3b7QgMeMlvFnq9eH5x8DN4nifI")
+TOKEN = 1700944919:AAE6NFOgD3b7QgMeMlvFnq9eH5x8DN4nifI
 CHANNEL_ID = -1003974767210
 GROUP_ID = -1004495179352
 DB_PATH = "publicaciones.db"
