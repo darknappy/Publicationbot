@@ -6,6 +6,7 @@ import sqlite3
 import gradio as gr
 from fastapi import Request
 from datetime import datetime, timezone
+from pathlib import Path
 
 from telegram import (
     Update,
@@ -32,10 +33,24 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("publicador")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-TOKEN = 1700944919:AAE6NFOgD3b7QgMeMlvFnq9eH5x8DN4nifI
-CHANNEL_ID = -1003974767210
-GROUP_ID = -1004495179352
-DB_PATH = "publicaciones.db"
+# ===== CONFIGURACIÓN CON VARIABLES DE ENTORNO =====
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise ValueError("❌ ERROR: Variable de entorno TELEGRAM_TOKEN no configurada")
+
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
+GROUP_ID = int(os.environ.get("GROUP_ID", "0"))
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+
+if not CHANNEL_ID or not GROUP_ID:
+    raise ValueError("❌ ERROR: CHANNEL_ID y GROUP_ID deben estar configurados en variables de entorno")
+
+# Ruta de base de datos: usa /tmp para Render o el directorio actual
+if os.environ.get("RENDER"):
+    DB_PATH = os.path.join("/tmp", "publicaciones.db")
+else:
+    DB_PATH = os.path.join(os.path.dirname(__file__), "publicaciones.db")
+
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "").lstrip("@")
 
 MAX_ARCHIVOS = 20
@@ -373,13 +388,14 @@ async def publicar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ms = await context.bot.send_media_group(CHANNEL_ID, [InputMediaDocument(fid) for fid in bloque], reply_to_message_id=ficha.message_id)
                 ids_arch.extend(x.message_id for x in ms)
 
+        ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
         ejecutar(
             "INSERT INTO publicaciones (user_id, username, nombre_usuario, nombre, capitulos, estado, idioma, sinopsis, foto, ficha_msg_id, archivos_msg_ids, fecha) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (q.from_user.id, q.from_user.username, q.from_user.full_name, d["nombre"], d.get("capitulos"), d["estado"], d.get("idioma"), d.get("sinopsis"), d.get("foto"), ficha.message_id, json.dumps(ids_arch), datetime.now(timezone.utc).isoformat(timespec="seconds"))
+            (q.from_user.id, q.from_user.username, q.from_user.full_name, d["nombre"], d.get("capitulos"), d["estado"], d.get("idioma"), d.get("sinopsis"), d.get("foto"), ficha.message_id, json.dumps(ids_arch), ahora)
         )
-    except Exception:
+    except Exception as e:
         log.exception("Error publicando")
-        await q.message.reply_text("⚠️ Ocurrió un error al publicar en el canal.")
+        await q.message.reply_text(f"⚠️ Ocurrió un error al publicar en el canal: {str(e)[:100]}")
     else:
         await actualizar_indice(context.bot)
         await q.message.reply_text("✅ ¡Publicado con éxito en el canal!")
@@ -652,9 +668,9 @@ async def eliminar_ejecutar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         ejecutar("DELETE FROM publicaciones WHERE id = ?", (pid,))
-    except Exception:
+    except Exception as e:
         log.exception("Error al eliminar la publicación %s", pid)
-        await q.edit_message_text("⚠️ Ocurrió un error al intentar eliminar la publicación.")
+        await q.edit_message_text(f"⚠️ Ocurrió un error al intentar eliminar: {str(e)[:100]}")
         await q.message.reply_text("Menú principal:", reply_markup=TECLADO_PRINCIPAL)
         return ConversationHandler.END
 
@@ -849,15 +865,20 @@ async def startup_event():
     await ptb_app.initialize()
     await ptb_app.start()
     
-    # Render asigna automáticamente la URL externa en esta variable de entorno
-    render_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if render_url:
-        webhook_url = f"{render_url}/telegram-webhook"
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
     else:
-        webhook_url = "https://tu-servicio.onrender.com/telegram-webhook"
+        log.warning("⚠️ RENDER_EXTERNAL_URL no configurada")
+        webhook_url = None
         
-    await ptb_app.bot.set_webhook(url=webhook_url)
-    log.info("Webhook configurado en Render: %s", webhook_url)
+    if webhook_url:
+        try:
+            await ptb_app.bot.set_webhook(url=webhook_url)
+            log.info("✅ Webhook configurado: %s", webhook_url)
+        except Exception as e:
+            log.error("❌ Error configurando webhook: %s", e)
+    else:
+        log.warning("❌ No se pudo configurar el webhook")
 
 @demo.app.on_event("shutdown")
 async def shutdown_event():
@@ -865,10 +886,14 @@ async def shutdown_event():
 
 @demo.app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, ptb_app.bot)
-    await ptb_app.process_update(update)
-    return {"ok": True}
+    try:
+        data = await request.json()
+        update = Update.de_json(data, ptb_app.bot)
+        await ptb_app.process_update(update)
+        return {"ok": True}
+    except Exception as e:
+        log.error("Error procesando update: %s", e)
+        return {"ok": False, "error": str(e)}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
