@@ -3,10 +3,10 @@ import html
 import json
 import logging
 import sqlite3
-import gradio as gr
-from fastapi import Request
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from datetime import datetime, timezone
-from pathlib import Path
+from contextlib import asynccontextmanager
 
 from telegram import (
     Update,
@@ -44,13 +44,14 @@ GROUP_ID = int(os.environ.get("GROUP_ID", "0"))
 if not CHANNEL_ID or not GROUP_ID:
     raise ValueError("❌ ERROR: CHANNEL_ID y GROUP_ID deben estar configurados en variables de entorno")
 
-# Ruta de base de datos: usa /tmp para Render o el directorio actual
+# Ruta de base de datos
 if os.environ.get("RENDER"):
     DB_PATH = os.path.join("/tmp", "publicaciones.db")
 else:
     DB_PATH = os.path.join(os.path.dirname(__file__), "publicaciones.db")
 
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "").lstrip("@")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 MAX_ARCHIVOS = 20
 
@@ -784,7 +785,7 @@ async def actualizar_indice(bot):
     except Exception:
         log.exception("No se pudo actualizar el índice")
 
-# --- Configuración de la Aplicación con Webhooks ---
+# --- Inicialización de la aplicación Telegram ---
 iniciar_db()
 ptb_app = Application.builder().token(TOKEN).build()
 
@@ -854,29 +855,16 @@ ptb_app.add_handler(conv_publicar)
 ptb_app.add_handler(conv_editar)
 ptb_app.add_handler(conv_eliminar)
 
-# --- Interfaz Gradio con FastAPI integrado ---
-with gr.Blocks() as demo:
-    gr.Markdown("# 🤖 Bot de Traducción de Novelas (Render)")
-    gr.Markdown("✅ Servicio de webhooks activo para Telegram.")
-    gr.Markdown(f"🔗 Base de datos: {DB_PATH}")
-
-ptb_app_instance = None
-
-@demo.app.on_event("startup")
-async def startup_event():
-    global ptb_app_instance
-    ptb_app_instance = ptb_app
-    
+# --- Contexto de lifespan para FastAPI ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     log.info("🚀 Iniciando aplicación...")
     await ptb_app.initialize()
     await ptb_app.start()
-    log.info("✅ Aplicación inicializada")
+    log.info("✅ Aplicación Telegram inicializada")
     
-    # Obtener URL de Render
-    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
-    
-    if render_url:
-        webhook_url = f"{render_url}/telegram-webhook"
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
         log.info(f"🔗 Configurando webhook: {webhook_url}")
         try:
             await ptb_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
@@ -885,14 +873,17 @@ async def startup_event():
             log.error(f"❌ Error configurando webhook: {e}")
     else:
         log.warning("⚠️ RENDER_EXTERNAL_URL no configurada. El bot no recibirá mensajes.")
-
-@demo.app.on_event("shutdown")
-async def shutdown_event():
+    
+    yield
+    
     log.info("🛑 Deteniendo aplicación...")
     await ptb_app.stop()
     log.info("✅ Aplicación detenida")
 
-@demo.app.post("/telegram-webhook")
+# --- Crear aplicación FastAPI ---
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
     """Recibe updates de Telegram"""
     try:
@@ -903,14 +894,20 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
     except Exception as e:
         log.error(f"❌ Error procesando update: {e}")
-        return {"ok": False, "error": str(e)}
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
 
-@demo.app.get("/health")
+@app.get("/health")
 async def health():
     """Health check para Render"""
-    return {"status": "ok", "db": DB_PATH}
+    return {"status": "ok", "db": DB_PATH, "webhook_url": f"{RENDER_EXTERNAL_URL}/telegram-webhook" if RENDER_EXTERNAL_URL else "Not configured"}
+
+@app.get("/")
+async def root():
+    """Raíz de la API"""
+    return {"status": "Bot activo", "endpoints": ["/health", "/telegram-webhook"]}
 
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 10000))
-    log.info(f"🌐 Iniciando servidor en puerto {port}...")
-    demo.launch(server_name="0.0.0.0", server_port=port, ssr_mode=False)
+    log.info(f"🌐 Iniciando servidor FastAPI en puerto {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
