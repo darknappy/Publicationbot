@@ -40,7 +40,6 @@ if not TOKEN:
 
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 GROUP_ID = int(os.environ.get("GROUP_ID", "0"))
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 if not CHANNEL_ID or not GROUP_ID:
     raise ValueError("❌ ERROR: CHANNEL_ID y GROUP_ID deben estar configurados en variables de entorno")
@@ -858,43 +857,60 @@ ptb_app.add_handler(conv_eliminar)
 # --- Interfaz Gradio con FastAPI integrado ---
 with gr.Blocks() as demo:
     gr.Markdown("# 🤖 Bot de Traducción de Novelas (Render)")
-    gr.Markdown("Servicio de webhooks activo para Telegram.")
+    gr.Markdown("✅ Servicio de webhooks activo para Telegram.")
+    gr.Markdown(f"🔗 Base de datos: {DB_PATH}")
+
+ptb_app_instance = None
 
 @demo.app.on_event("startup")
 async def startup_event():
+    global ptb_app_instance
+    ptb_app_instance = ptb_app
+    
+    log.info("🚀 Iniciando aplicación...")
     await ptb_app.initialize()
     await ptb_app.start()
+    log.info("✅ Aplicación inicializada")
     
-    if RENDER_EXTERNAL_URL:
-        webhook_url = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
-    else:
-        log.warning("⚠️ RENDER_EXTERNAL_URL no configurada")
-        webhook_url = None
-        
-    if webhook_url:
+    # Obtener URL de Render
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    
+    if render_url:
+        webhook_url = f"{render_url}/telegram-webhook"
+        log.info(f"🔗 Configurando webhook: {webhook_url}")
         try:
-            await ptb_app.bot.set_webhook(url=webhook_url)
-            log.info("✅ Webhook configurado: %s", webhook_url)
+            await ptb_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+            log.info(f"✅ Webhook configurado correctamente en: {webhook_url}")
         except Exception as e:
-            log.error("❌ Error configurando webhook: %s", e)
+            log.error(f"❌ Error configurando webhook: {e}")
     else:
-        log.warning("❌ No se pudo configurar el webhook")
+        log.warning("⚠️ RENDER_EXTERNAL_URL no configurada. El bot no recibirá mensajes.")
 
 @demo.app.on_event("shutdown")
 async def shutdown_event():
+    log.info("🛑 Deteniendo aplicación...")
     await ptb_app.stop()
+    log.info("✅ Aplicación detenida")
 
 @demo.app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
+    """Recibe updates de Telegram"""
     try:
         data = await request.json()
+        log.debug(f"📨 Update recibido: {data.get('update_id')}")
         update = Update.de_json(data, ptb_app.bot)
         await ptb_app.process_update(update)
         return {"ok": True}
     except Exception as e:
-        log.error("Error procesando update: %s", e)
+        log.error(f"❌ Error procesando update: {e}")
         return {"ok": False, "error": str(e)}
+
+@demo.app.get("/health")
+async def health():
+    """Health check para Render"""
+    return {"status": "ok", "db": DB_PATH}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    log.info(f"🌐 Iniciando servidor en puerto {port}...")
     demo.launch(server_name="0.0.0.0", server_port=port, ssr_mode=False)
