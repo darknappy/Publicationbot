@@ -51,13 +51,14 @@ else:
     DB_PATH = os.path.join(os.path.dirname(__file__), "publicaciones.db")
 
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "").lstrip("@")
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("")
 
 MAX_ARCHIVOS = 20
 
 MENU, CAMPO_VALOR, ARCHIVOS, CONFIRMAR = range(4)
 ED_ELEGIR, ED_CAMPO, ED_VALOR = range(4, 7)
 EL_ELEGIR = 10
+LOTE_FILES = 11
 
 ESTADOS = {
     "encurso": "En curso",
@@ -73,8 +74,8 @@ IDIOMAS = {
 
 TECLADO_PRINCIPAL = ReplyKeyboardMarkup(
     [
-        ["📖 Publicar", "✏️ Editar"],
-        ["🗑 Eliminar"],
+        ["📖 Publicar", "📚 Lote"],
+        ["✏️ Editar", "🗑 Eliminar"],
     ],
     resize_keyboard=True,
 )
@@ -216,6 +217,21 @@ async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⬇️ Panel activo (teclado inferior oculto)", reply_markup=ReplyKeyboardRemove())
     return MENU
 
+async def iniciar_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await es_miembro(context, user.id):
+        await update.message.reply_text("⛔ Solo los miembros del grupo pueden publicar en lote.", reply_markup=TECLADO_PRINCIPAL)
+        return ConversationHandler.END
+
+    context.user_data["lote"] = {"archivos": []}
+    await update.message.reply_text(
+        "📎 Envía los archivos que quieres publicar en lote (máx. {}).\nCuando termines, pulsa el botón <b>Listo</b>.".format(MAX_ARCHIVOS),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Listo", callback_data="lote_listo")]]),
+        parse_mode=ParseMode.HTML,
+    )
+    await update.message.reply_text("⬇️ Enviar archivos (teclado inferior oculto)", reply_markup=ReplyKeyboardRemove())
+    return LOTE_FILES
+
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -333,6 +349,20 @@ async def recibir_archivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📎 Archivos recibidos: {len(d['archivos'])}")
     return ARCHIVOS
 
+async def recibir_lote_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    d = context.user_data.get("lote")
+    if not d:
+        d = {"archivos": []}
+        context.user_data["lote"] = d
+    if len(d["archivos"]) >= MAX_ARCHIVOS:
+        await update.message.reply_text(f"Máximo de {MAX_ARCHIVOS} archivos alcanzado.")
+        return LOTE_FILES
+    doc = update.message.document
+    # guardamos file_id y nombre original
+    d["archivos"].append({"file_id": doc.file_id, "file_name": doc.file_name})
+    await update.message.reply_text(f"📎 Archivos recibidos (lote): {len(d['archivos'])}")
+    return LOTE_FILES
+
 async def archivos_listos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     d = context.user_data["novela"]
@@ -359,6 +389,48 @@ async def archivos_listos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]])
     )
     return CONFIRMAR
+
+async def lote_listo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    d = context.user_data.get("lote")
+    if not d or not d.get("archivos"):
+        await q.answer("Debes subir al menos un archivo.", show_alert=True)
+        return LOTE_FILES
+    await q.edit_message_reply_markup(None)
+
+    autor = f"@{q.from_user.username}" if q.from_user.username else (q.from_user.full_name or "Anónimo")
+    bot = context.bot
+    publicados = 0
+    for item in d["archivos"]:
+        file_id = item["file_id"]
+        fname = item.get("file_name") or "Documento"
+        nombre = os.path.splitext(fname)[0]
+        ficha_texto = construir_ficha(nombre, None, "En curso", None, None, autor, False)
+        try:
+            m = await bot.send_document(CHANNEL_ID, file_id, caption=ficha_texto, parse_mode=ParseMode.HTML)
+            ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            # Intentamos guardar en la base de datos, si está disponible
+            try:
+                ejecutar(
+                    "INSERT INTO publicaciones (user_id, username, nombre_usuario, nombre, capitulos, estado, idioma, sinopsis, foto, ficha_msg_id, archivos_msg_ids, fecha) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (q.from_user.id, q.from_user.username, q.from_user.full_name, nombre, None, "En curso", None, None, None, m.message_id, json.dumps([]), ahora),
+                )
+            except Exception:
+                log.warning("No se pudo guardar la publicación en la DB. Seguiremos sin persistencia local.")
+            publicados += 1
+        except Exception as e:
+            log.exception("Error publicando item de lote: %s", e)
+
+    try:
+        await actualizar_indice(bot)
+    except Exception:
+        log.exception("Error actualizando indice después de lote")
+
+    await q.message.reply_text(f"✅ Publicados {publicados} archivo(s) en el canal.")
+    context.user_data.clear()
+    await q.message.reply_text("Menú principal:", reply_markup=TECLADO_PRINCIPAL)
+    return ConversationHandler.END
 
 async def publicar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -391,13 +463,16 @@ async def publicar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
         ejecutar(
             "INSERT INTO publicaciones (user_id, username, nombre_usuario, nombre, capitulos, estado, idioma, sinopsis, foto, ficha_msg_id, archivos_msg_ids, fecha) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (q.from_user.id, q.from_user.username, q.from_user.full_name, d["nombre"], d.get("capitulos"), d["estado"], d.get("idioma"), d.get("sinopsis"), d.get("foto"), ficha.message_id, json.dumps(ids_arch), ahora)
+            (q.from_user.id, q.from_user.username, q.from_user.full_name, d["nombre"], d.get("capitulos"), d["estado"], d.get("idioma"), d.get("sinopsis"), d.get("foto"), ficha.message_id, json.dumps(ids_arch), ahora),
         )
     except Exception as e:
         log.exception("Error publicando")
         await q.message.reply_text(f"⚠️ Ocurrió un error al publicar en el canal: {str(e)[:100]}")
     else:
-        await actualizar_indice(context.bot)
+        try:
+            await actualizar_indice(context.bot)
+        except Exception:
+            log.exception("Error actualizando indice después de publicar")
         await q.message.reply_text("✅ ¡Publicado con éxito en el canal!")
 
     context.user_data.clear()
@@ -502,7 +577,7 @@ async def editar_campo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def editar_valor_recibir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     campo = context.user_data.get("ed_campo")
-    pub = obtener_publicacion(context.user_data["ed_id"])
+    pub = obtener_publicacion(context.user_data["ed_id"]) 
     bot = context.bot
     valor = None
 
@@ -534,7 +609,7 @@ async def editar_valor_callback(update: Update, context: ContextTypes.DEFAULT_TY
     q = update.callback_query
     await q.answer()
     data = q.data
-    pub = obtener_publicacion(context.user_data["ed_id"])
+    pub = obtener_publicacion(context.user_data["ed_id"]) 
     bot = context.bot
     campo = context.user_data.get("ed_campo")
     valor = None
@@ -674,7 +749,11 @@ async def eliminar_ejecutar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Menú principal:", reply_markup=TECLADO_PRINCIPAL)
         return ConversationHandler.END
 
-    await actualizar_indice(bot)
+    try:
+        await actualizar_indice(bot)
+    except Exception:
+        log.exception("Error actualizando indice después de eliminar")
+
     await q.edit_message_text("✅ Publicación eliminada del canal, de la base de datos y del índice con éxito.")
     await q.message.reply_text("Menú principal:", reply_markup=TECLADO_PRINCIPAL)
     return ConversationHandler.END
@@ -693,15 +772,21 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 SIN_VISTA_PREVIA = LinkPreviewOptions(is_disabled=True)
 
 def meta_get(clave):
-    r = ejecutar("SELECT valor FROM meta WHERE clave = ?", (clave,), fetch="one")
-    return r["valor"] if r else None
+    try:
+        r = ejecutar("SELECT valor FROM meta WHERE clave = ?", (clave,), fetch="one")
+        return r["valor"] if r else None
+    except Exception:
+        return None
 
 def meta_set(clave, valor):
-    ejecutar(
-        "INSERT INTO meta (clave, valor) VALUES (?, ?) "
-        "ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor",
-        (clave, valor),
-    )
+    try:
+        ejecutar(
+            "INSERT INTO meta (clave, valor) VALUES (?, ?) "
+            "ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor",
+            (clave, valor),
+        )
+    except Exception:
+        log.warning("No se pudo guardar meta en la base de datos")
 
 def enlace(msg_id: int) -> str:
     if CHANNEL_USERNAME:
@@ -730,8 +815,8 @@ def textos_indice(pubs) -> list[str]:
         idio_str = f' [{esc(p["idioma"])}]' if p["idioma"] else ''
         
         linea = (
-            f'• <a href="{enlace(p["ficha_msg_id"])}">{esc(p["nombre"])}</a>'
-            f'{cap_str}{idio_str} · {esc(p["estado"])}'
+            f'• <a href="{enlace(p["ficha_msg_id"])}}">{esc(p["nombre"])}</a>'
+            f'{cap_str}{idio_str} · {esc(p["estado"]) }'
         )
         if len(actual) + len(linea) + 40 > 4000 or ents + 2 > 95:
             mensajes.append(actual)
@@ -747,12 +832,36 @@ def textos_indice(pubs) -> list[str]:
     return mensajes
 
 def ids_indice() -> list[int]:
-    return json.loads(meta_get("indice_ids") or "[]")
+    val = meta_get("indice_ids")
+    if val:
+        try:
+            return json.loads(val)
+        except Exception:
+            return []
+    return []
 
 async def actualizar_indice(bot):
     try:
-        textos = textos_indice(ejecutar("SELECT * FROM publicaciones", fetch="all"))
+        pubs = []
+        try:
+            pubs = ejecutar("SELECT * FROM publicaciones", fetch="all")
+        except Exception:
+            # DB no disponible o vacía
+            pubs = []
+
+        textos = textos_indice(pubs)
         ids = ids_indice()
+
+        # Si no hay ids guardadas, intentamos recuperar el mensaje anclado del canal
+        if not ids:
+            try:
+                chat = await bot.get_chat(CHANNEL_ID)
+                pinned = getattr(chat, "pinned_message", None)
+                if pinned and getattr(pinned, "text", "").startswith("📚"):
+                    ids = [pinned.message_id]
+            except Exception:
+                pass
+
         nuevos = []
 
         for i, t in enumerate(textos):
@@ -776,12 +885,18 @@ async def actualizar_indice(bot):
                 except Exception:
                     pass
 
+        # Eliminamos mensajes de indice sobrantes
         for mid in ids[len(textos):]:
             try:
                 await bot.delete_message(CHANNEL_ID, mid)
             except Exception:
                 pass
-        meta_set("indice_ids", json.dumps(nuevos))
+
+        # Intentamos persistir en la DB, si está disponible
+        try:
+            meta_set("indice_ids", json.dumps(nuevos))
+        except Exception:
+            log.warning("No se pudo guardar indice en la DB; el índice se mantendrá en mensajes anclados si es posible.")
     except Exception:
         log.exception("No se pudo actualizar el índice")
 
@@ -799,7 +914,7 @@ conv_publicar = ConversationHandler(
         CAMPO_VALOR: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_valor),
             MessageHandler(filters.PHOTO, recibir_valor),
-            CallbackQueryHandler(callback_valor_especial, pattern=r"^(est:|idio:|quitar_)"),
+            CallbackQueryHandler(callback_valor_especial, pattern=r"^(est:|idio:|quitar_)") ,
         ],
         ARCHIVOS: [
             MessageHandler(filters.Document.ALL, recibir_archivo),
@@ -808,6 +923,21 @@ conv_publicar = ConversationHandler(
         CONFIRMAR: [
             CallbackQueryHandler(publicar, pattern=r"^publicar$"),
             CallbackQueryHandler(cancelar, pattern=r"^cancelar$"),
+        ],
+    },
+    fallbacks=[CommandHandler("cancelar", cancelar)],
+    allow_reentry=True,
+)
+
+conv_lote = ConversationHandler(
+    entry_points=[
+        CommandHandler("lote", iniciar_lote, filters=filters.ChatType.PRIVATE),
+        MessageHandler(filters.Regex("^📚 Lote$") & filters.ChatType.PRIVATE, iniciar_lote),
+    ],
+    states={
+        LOTE_FILES: [
+            MessageHandler(filters.Document.ALL, recibir_lote_file),
+            CallbackQueryHandler(lote_listo, pattern=r"^lote_listo$"),
         ],
     },
     fallbacks=[CommandHandler("cancelar", cancelar)],
@@ -852,6 +982,7 @@ conv_eliminar = ConversationHandler(
 
 ptb_app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
 ptb_app.add_handler(conv_publicar)
+ptb_app.add_handler(conv_lote)
 ptb_app.add_handler(conv_editar)
 ptb_app.add_handler(conv_eliminar)
 
