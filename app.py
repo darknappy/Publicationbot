@@ -358,7 +358,6 @@ async def recibir_lote_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Máximo de {MAX_ARCHIVOS} archivos alcanzado.")
         return LOTE_FILES
     doc = update.message.document
-    # guardamos file_id y nombre original
     d["archivos"].append({"file_id": doc.file_id, "file_name": doc.file_name})
     await update.message.reply_text(f"📎 Archivos recibidos (lote): {len(d['archivos'])}")
     return LOTE_FILES
@@ -410,7 +409,6 @@ async def lote_listo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             m = await bot.send_document(CHANNEL_ID, file_id, caption=ficha_texto, parse_mode=ParseMode.HTML)
             ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            # Intentamos guardar en la base de datos, si está disponible
             try:
                 ejecutar(
                     "INSERT INTO publicaciones (user_id, username, nombre_usuario, nombre, capitulos, estado, idioma, sinopsis, foto, ficha_msg_id, archivos_msg_ids, fecha) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -815,7 +813,7 @@ def textos_indice(pubs) -> list[str]:
         idio_str = f' [{esc(p["idioma"])}]' if p["idioma"] else ''
         
         linea = (
-            f'• <a href="{enlace(p["ficha_msg_id"])}}">{esc(p["nombre"])}</a>'
+            f'• <a href="{enlace(p["ficha_msg_id"])}">{esc(p["nombre"])}</a>'
             f'{cap_str}{idio_str} · {esc(p["estado"]) }'
         )
         if len(actual) + len(linea) + 40 > 4000 or ents + 2 > 95:
@@ -846,13 +844,11 @@ async def actualizar_indice(bot):
         try:
             pubs = ejecutar("SELECT * FROM publicaciones", fetch="all")
         except Exception:
-            # DB no disponible o vacía
             pubs = []
 
         textos = textos_indice(pubs)
         ids = ids_indice()
 
-        # Si no hay ids guardadas, intentamos recuperar el mensaje anclado del canal
         if not ids:
             try:
                 chat = await bot.get_chat(CHANNEL_ID)
@@ -885,14 +881,12 @@ async def actualizar_indice(bot):
                 except Exception:
                     pass
 
-        # Eliminamos mensajes de indice sobrantes
         for mid in ids[len(textos):]:
             try:
                 await bot.delete_message(CHANNEL_ID, mid)
             except Exception:
                 pass
 
-        # Intentamos persistir en la DB, si está disponible
         try:
             meta_set("indice_ids", json.dumps(nuevos))
         except Exception:
@@ -1016,7 +1010,6 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
-    """Recibe updates de Telegram"""
     try:
         data = await request.json()
         log.debug(f"📨 Update recibido: {data.get('update_id')}")
@@ -1029,12 +1022,10 @@ async def telegram_webhook(request: Request):
 
 @app.get("/health")
 async def health():
-    """Health check para Render"""
     return {"status": "ok", "db": DB_PATH, "webhook_url": f"{RENDER_EXTERNAL_URL}/telegram-webhook" if RENDER_EXTERNAL_URL else "Not configured"}
 
 @app.get("/")
 async def root():
-    """Raíz de la API"""
     return {"status": "Bot activo", "endpoints": ["/health", "/telegram-webhook"]}
 
 if __name__ == "__main__":
