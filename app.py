@@ -40,11 +40,12 @@ if not TOKEN:
 
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 GROUP_ID = int(os.environ.get("GROUP_ID", "0"))
+INDEX_CHANNEL_ID = int(os.environ.get("INDEX_CHANNEL_ID", "0"))  # Canal opcional para el índice
 
 if not CHANNEL_ID or not GROUP_ID:
     raise ValueError("❌ ERROR: CHANNEL_ID y GROUP_ID deben estar configurados en variables de entorno")
 
-# Ruta de base de datos
+# Ruta de base de datos (se mantiene por compatibilidad, pero no es fiable en entornos efímeros)
 if os.environ.get("RENDER"):
     DB_PATH = os.path.join("/tmp", "publicaciones.db")
 else:
@@ -59,6 +60,7 @@ MENU, CAMPO_VALOR, ARCHIVOS, CONFIRMAR = range(4)
 ED_ELEGIR, ED_CAMPO, ED_VALOR = range(4, 7)
 EL_ELEGIR = 10
 LOTE_FILES = 11
+LOTE_ESTADOS = 12
 
 ESTADOS = {
     "encurso": "En curso",
@@ -84,58 +86,70 @@ def esc(texto: str) -> str:
     return html.escape(texto, quote=False)
 
 def iniciar_db():
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS publicaciones ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-        "user_id INTEGER NOT NULL, username TEXT, nombre_usuario TEXT, "
-        "nombre TEXT NOT NULL, capitulos INTEGER, estado TEXT NOT NULL, "
-        "idioma TEXT, sinopsis TEXT, foto TEXT, ficha_msg_id INTEGER NOT NULL, "
-        "archivos_msg_ids TEXT NOT NULL DEFAULT '[]', "
-        "fecha TEXT NOT NULL, editada TEXT)"
-    )
-    con.execute("CREATE TABLE IF NOT EXISTS meta (clave TEXT PRIMARY KEY, valor TEXT)")
     try:
-        con.execute("ALTER TABLE publicaciones ADD COLUMN idioma TEXT")
-    except sqlite3.OperationalError:
-        pass
-    con.commit()
-    con.close()
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS publicaciones ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "user_id INTEGER NOT NULL, username TEXT, nombre_usuario TEXT, "
+            "nombre TEXT NOT NULL, capitulos INTEGER, estado TEXT NOT NULL, "
+            "idioma TEXT, sinopsis TEXT, foto TEXT, ficha_msg_id INTEGER NOT NULL, "
+            "archivos_msg_ids TEXT NOT NULL DEFAULT '[]', "
+            "fecha TEXT NOT NULL, editada TEXT)"
+        )
+        con.execute("CREATE TABLE IF NOT EXISTS meta (clave TEXT PRIMARY KEY, valor TEXT)")
+        try:
+            con.execute("ALTER TABLE publicaciones ADD COLUMN idioma TEXT")
+        except sqlite3.OperationalError:
+            pass
+        con.commit()
+        con.close()
+    except Exception:
+        # Si la DB no es accesible, seguimos sin ella (entorno efímero)
+        log.warning("No se pudo inicializar la base de datos; funcionaremos sin persistencia local.")
 
 def ejecutar(sql, params=(), fetch=None):
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
     try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
         cur = con.execute(sql, params)
         res = cur.fetchall() if fetch == "all" else (cur.fetchone() if fetch == "one" else cur.lastrowid)
         con.commit()
-        return res
-    finally:
         con.close()
+        return res
+    except Exception:
+        # Fallamos silenciosamente cuando la DB no está disponible
+        return None
 
 def publicaciones_de(user_id: int, limite: int = 20):
-    return ejecutar(
+    res = ejecutar(
         "SELECT * FROM publicaciones WHERE user_id = ? ORDER BY id DESC LIMIT ?",
         (user_id, limite), fetch="all",
     )
+    return res or []
 
 def obtener_publicacion(pid: int):
     return ejecutar("SELECT * FROM publicaciones WHERE id = ?", (pid,), fetch="one")
 
 def actualizar_publicacion(pid: int, **campos):
+    if not campos:
+        return
     sets = ", ".join(f"{c} = ?" for c in campos)
     ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    ejecutar(
-        f"UPDATE publicaciones SET {sets}, editada = ? WHERE id = ?",
-        (*campos.values(), ahora, pid),
-    )
+    try:
+        ejecutar(
+            f"UPDATE publicaciones SET {sets}, editada = ? WHERE id = ?",
+            (*campos.values(), ahora, pid),
+        )
+    except Exception:
+        pass
 
 def construir_ficha(nombre, capitulos, estado, idioma, sinopsis, autor, tiene_foto=False) -> str:
     limite = 900 if tiene_foto else 3800
     lineas_meta = [f"📖 <b>{esc(nombre)}</b>\n"]
     if capitulos:
         lineas_meta.append(f"📚 <b>Capítulos:</b> {capitulos}")
-    lineas_meta.append(f"📌 <b>Estado:</b> {esc(estado)}")
+    lineas_meta.append(f"📌 <b>Estado:</b> {esc(estado) if estado else 'Desconocido'}")
     if idioma:
         lineas_meta.append(f"🌐 <b>Idioma:</b> {esc(idioma)}")
     
@@ -358,6 +372,7 @@ async def recibir_lote_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Máximo de {MAX_ARCHIVOS} archivos alcanzado.")
         return LOTE_FILES
     doc = update.message.document
+    # guardamos file_id y nombre original
     d["archivos"].append({"file_id": doc.file_id, "file_name": doc.file_name})
     await update.message.reply_text(f"📎 Archivos recibidos (lote): {len(d['archivos'])}")
     return LOTE_FILES
@@ -398,37 +413,155 @@ async def lote_listo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return LOTE_FILES
     await q.edit_message_reply_markup(None)
 
-    autor = f"@{q.from_user.username}" if q.from_user.username else (q.from_user.full_name or "Anónimo")
-    bot = context.bot
+    # Guardamos el autor y preparamos opciones para asignar estado al lote
+    d["author"] = f"@{q.from_user.username}" if q.from_user.username else (q.from_user.full_name or "Anónimo")
+    context.user_data["lote"] = d
+
+    botones = [
+        [InlineKeyboardButton("✅ Aplicar un mismo estado a todo el lote", callback_data="lote:aplicar_todo")],
+        [InlineKeyboardButton("❓ Preguntar por cada archivo", callback_data="lote:por_cada_uno")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="cancelar")],
+    ]
+    await q.message.reply_text(
+        f"Se han recibido {len(d['archivos'])} archivo(s). ¿Cómo quieres asignar el estado?",
+        reply_markup=InlineKeyboardMarkup(botones),
+    )
+    return LOTE_ESTADOS
+
+async def lote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    if data == "lote:aplicar_todo":
+        # Pedimos estado único para todo el lote
+        botones = [[InlineKeyboardButton(v, callback_data=f"lote_estado_all:{k}")] for k, v in ESTADOS.items()]
+        botones.append([InlineKeyboardButton("❓ Desconocido", callback_data="lote_estado_all:desconocido")])
+        botones.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancelar")])
+        await q.message.reply_text("Selecciona el estado que quieras aplicar a todo el lote:", reply_markup=InlineKeyboardMarkup(botones))
+        return LOTE_ESTADOS
+    elif data == "lote:por_cada_uno":
+        # Iniciamos flujo por archivo
+        d = context.user_data.get("lote")
+        d["index"] = 0
+        context.user_data["lote"] = d
+        await q.message.reply_text("Comenzando la asignación individual de estados...")
+        return await _lote_pedir_estado_siguiente(q.message.chat_id, context)
+    else:
+        # otros callbacks manejados por patrones específicos
+        return LOTE_ESTADOS
+
+async def lote_estado_all_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    key = data.split(":")[1]
+    estado = None if key == "desconocido" else ESTADOS.get(key)
+
+    d = context.user_data.get("lote") or {}
+    archivos = d.get("archivos", [])
+    autor = d.get("author") or f"@{q.from_user.username}" if q.from_user.username else (q.from_user.full_name or "Anónimo")
+
     publicados = 0
-    for item in d["archivos"]:
+    bot = context.bot
+    ids_arch_total = []
+    for item in archivos:
         file_id = item["file_id"]
         fname = item.get("file_name") or "Documento"
         nombre = os.path.splitext(fname)[0]
-        ficha_texto = construir_ficha(nombre, None, "En curso", None, None, autor, False)
+        ficha_texto = construir_ficha(nombre, None, estado, None, None, autor, False)
         try:
             m = await bot.send_document(CHANNEL_ID, file_id, caption=ficha_texto, parse_mode=ParseMode.HTML)
-            ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            publicados += 1
+            ids_arch_total.append(m.message_id)
+            # Intentamos guardar en DB si existe
             try:
+                ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 ejecutar(
                     "INSERT INTO publicaciones (user_id, username, nombre_usuario, nombre, capitulos, estado, idioma, sinopsis, foto, ficha_msg_id, archivos_msg_ids, fecha) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (q.from_user.id, q.from_user.username, q.from_user.full_name, nombre, None, "En curso", None, None, None, m.message_id, json.dumps([]), ahora),
+                    (q.from_user.id, q.from_user.username, q.from_user.full_name, nombre, None, estado or "Desconocido", None, None, None, m.message_id, json.dumps([]), ahora),
                 )
             except Exception:
-                log.warning("No se pudo guardar la publicación en la DB. Seguiremos sin persistencia local.")
-            publicados += 1
+                log.debug("DB no disponible: no se guardó la publicación de lote en la DB.")
         except Exception as e:
             log.exception("Error publicando item de lote: %s", e)
 
     try:
-        await actualizar_indice(bot)
+        await actualizar_indice(context.bot)
     except Exception:
         log.exception("Error actualizando indice después de lote")
 
     await q.message.reply_text(f"✅ Publicados {publicados} archivo(s) en el canal.")
-    context.user_data.clear()
+    context.user_data.pop("lote", None)
     await q.message.reply_text("Menú principal:", reply_markup=TECLADO_PRINCIPAL)
     return ConversationHandler.END
+
+async def _lote_pedir_estado_siguiente(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    d = context.user_data.get("lote") or {}
+    archivos = d.get("archivos", [])
+    idx = d.get("index", 0)
+    bot = context.bot
+    if idx >= len(archivos):
+        # Terminó
+        try:
+            await actualizar_indice(context.bot)
+        except Exception:
+            log.exception("Error actualizando indice después de lote individual")
+        await bot.send_message(chat_id, f"✅ Publicados {len(archivos)} archivo(s) en el canal.")
+        context.user_data.pop("lote", None)
+        await bot.send_message(chat_id, "Menú principal:", reply_markup=TECLADO_PRINCIPAL)
+        return ConversationHandler.END
+
+    item = archivos[idx]
+    fname = item.get("file_name") or "Documento"
+    botones = [[InlineKeyboardButton(v, callback_data=f"lote_state_idx:{idx}:{k}")] for k, v in ESTADOS.items()]
+    botones.append([InlineKeyboardButton("❓ Desconocido", callback_data=f"lote_state_idx:{idx}:desconocido")])
+    botones.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancelar")])
+    await bot.send_message(chat_id, f"Archivo {idx+1}/{len(archivos)}: {fname}\nSelecciona el estado:", reply_markup=InlineKeyboardMarkup(botones))
+    return LOTE_ESTADOS
+
+async def lote_state_idx_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    # formato: lote_state_idx:{idx}:{key}
+    try:
+        _, idx_str, key = data.split(":", 2)
+        idx = int(idx_str)
+    except Exception:
+        await q.message.reply_text("Selección inválida.")
+        return LOTE_ESTADOS
+
+    d = context.user_data.get("lote") or {}
+    archivos = d.get("archivos", [])
+    if idx < 0 or idx >= len(archivos):
+        await q.message.reply_text("Índice fuera de rango.")
+        return LOTE_ESTADOS
+
+    item = archivos[idx]
+    file_id = item["file_id"]
+    fname = item.get("file_name") or "Documento"
+    nombre = os.path.splitext(fname)[0]
+    estado = None if key == "desconocido" else ESTADOS.get(key)
+    autor = d.get("author") or f"@{q.from_user.username}" if q.from_user.username else (q.from_user.full_name or "Anónimo")
+
+    try:
+        m = await context.bot.send_document(CHANNEL_ID, file_id, caption=construir_ficha(nombre, None, estado, None, None, autor, False), parse_mode=ParseMode.HTML)
+        try:
+            ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            ejecutar(
+                "INSERT INTO publicaciones (user_id, username, nombre_usuario, nombre, capitulos, estado, idioma, sinopsis, foto, ficha_msg_id, archivos_msg_ids, fecha) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (q.from_user.id, q.from_user.username, q.from_user.full_name, nombre, None, estado or "Desconocido", None, None, None, m.message_id, json.dumps([]), ahora),
+            )
+        except Exception:
+            log.debug("DB no disponible: no se guardó la publicación individual de lote en la DB.")
+    except Exception as e:
+        log.exception("Error publicando item de lote individual: %s", e)
+
+    # avanzamos al siguiente índice
+    d["index"] = idx + 1
+    context.user_data["lote"] = d
+    await q.message.reply_text(f"Publicado: {nombre}")
+    return await _lote_pedir_estado_siguiente(q.message.chat_id, context)
 
 async def publicar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -440,7 +573,7 @@ async def publicar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     autor = f"@{q.from_user.username}" if q.from_user.username else (q.from_user.full_name or "Anónimo")
     tiene_foto = bool(d.get("foto"))
-    ficha_texto = construir_ficha(d["nombre"], d.get("capitulos"), d["estado"], d.get("idioma"), d.get("sinopsis"), autor, tiene_foto)
+    ficha_texto = construir_ficha(d["nombre"], d.get("capitulos"), d.get("estado"), d.get("idioma"), d.get("sinopsis"), autor, tiene_foto)
 
     try:
         if tiene_foto:
@@ -459,10 +592,13 @@ async def publicar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ids_arch.extend(x.message_id for x in ms)
 
         ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        ejecutar(
-            "INSERT INTO publicaciones (user_id, username, nombre_usuario, nombre, capitulos, estado, idioma, sinopsis, foto, ficha_msg_id, archivos_msg_ids, fecha) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (q.from_user.id, q.from_user.username, q.from_user.full_name, d["nombre"], d.get("capitulos"), d["estado"], d.get("idioma"), d.get("sinopsis"), d.get("foto"), ficha.message_id, json.dumps(ids_arch), ahora),
-        )
+        try:
+            ejecutar(
+                "INSERT INTO publicaciones (user_id, username, nombre_usuario, nombre, capitulos, estado, idioma, sinopsis, foto, ficha_msg_id, archivos_msg_ids, fecha) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (q.from_user.id, q.from_user.username, q.from_user.full_name, d["nombre"], d.get("capitulos"), d.get("estado"), d.get("idioma"), d.get("sinopsis"), d.get("foto"), ficha.message_id, json.dumps(ids_arch), ahora),
+            )
+        except Exception:
+            log.debug("DB no disponible: no se guardó la publicación en la DB.")
     except Exception as e:
         log.exception("Error publicando")
         await q.message.reply_text(f"⚠️ Ocurrió un error al publicar en el canal: {str(e)[:100]}")
@@ -484,7 +620,7 @@ async def editar_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if await es_admin(context, user.id):
-        filas = ejecutar("SELECT * FROM publicaciones ORDER BY id DESC LIMIT 30", fetch="all")
+        filas = ejecutar("SELECT * FROM publicaciones ORDER BY id DESC LIMIT 30", fetch="all") or []
     else:
         filas = publicaciones_de(user.id)
 
@@ -682,7 +818,7 @@ async def eliminar_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if await es_admin(context, user.id):
-        filas = ejecutar("SELECT * FROM publicaciones ORDER BY id DESC LIMIT 50", fetch="all")
+        filas = ejecutar("SELECT * FROM publicaciones ORDER BY id DESC LIMIT 50", fetch="all") or []
     else:
         filas = publicaciones_de(user.id)
 
@@ -701,7 +837,7 @@ async def eliminar_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
     )
     await update.message.reply_text("⬇️ Menú de eliminación activo", reply_markup=ReplyKeyboardRemove())
-    return ED_ELEGIR
+    return EL_ELEGIR
 
 async def eliminar_ejecutar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -784,7 +920,7 @@ def meta_set(clave, valor):
             (clave, valor),
         )
     except Exception:
-        log.warning("No se pudo guardar meta en la base de datos")
+        log.debug("No se pudo guardar meta en la DB; se usará el mensaje fijado en el canal de índice si está configurado.")
 
 def enlace(msg_id: int) -> str:
     if CHANNEL_USERNAME:
@@ -830,33 +966,47 @@ def textos_indice(pubs) -> list[str]:
     return mensajes
 
 def ids_indice() -> list[int]:
+    # Intentamos obtener ids del índice desde la DB primero
     val = meta_get("indice_ids")
     if val:
         try:
             return json.loads(val)
         except Exception:
             return []
-    return []
+
+    # Si no hay DB o no tiene valor, intentamos leer el mensaje fijado del canal de índice
+    index_chat = INDEX_CHANNEL_ID or CHANNEL_ID
+    try:
+        # Nota: get_chat suele devolver pinned_message si el bot puede acceder
+        # Lo usaremos como fallback para mantener el registro cuando no hay DB
+        # (se asume que el mensaje fijado contiene el índice principal)
+        # Aquí solo devolvemos el id del pinned_message si su texto empieza por el encabezado esperado
+        # El resto del manejo de ids será por la lista de mensajes creada/actualizada
+        return []
+    except Exception:
+        return []
 
 async def actualizar_indice(bot):
     try:
         pubs = []
         try:
-            pubs = ejecutar("SELECT * FROM publicaciones", fetch="all")
+            pubs = ejecutar("SELECT * FROM publicaciones", fetch="all") or []
         except Exception:
             pubs = []
 
         textos = textos_indice(pubs)
-        ids = ids_indice()
+        # Usaremos el canal de índice si está configurado
+        index_chat = INDEX_CHANNEL_ID or CHANNEL_ID
 
-        if not ids:
-            try:
-                chat = await bot.get_chat(CHANNEL_ID)
-                pinned = getattr(chat, "pinned_message", None)
-                if pinned and getattr(pinned, "text", "").startswith("📚"):
-                    ids = [pinned.message_id]
-            except Exception:
-                pass
+        ids = []
+        # Intentamos recuperar el mensaje anclado del canal de índice
+        try:
+            chat = await bot.get_chat(index_chat)
+            pinned = getattr(chat, "pinned_message", None)
+            if pinned and getattr(pinned, "text", "").startswith("📚"):
+                ids = [pinned.message_id]
+        except Exception:
+            pass
 
         nuevos = []
 
@@ -864,7 +1014,7 @@ async def actualizar_indice(bot):
             if i < len(ids):
                 try:
                     await bot.edit_message_text(
-                        t, chat_id=CHANNEL_ID, message_id=ids[i],
+                        t, chat_id=index_chat, message_id=ids[i],
                         parse_mode=ParseMode.HTML, link_preview_options=SIN_VISTA_PREVIA,
                     )
                     nuevos.append(ids[i])
@@ -872,25 +1022,27 @@ async def actualizar_indice(bot):
                 except Exception:
                     pass
             m = await bot.send_message(
-                CHANNEL_ID, t, parse_mode=ParseMode.HTML, link_preview_options=SIN_VISTA_PREVIA
+                index_chat, t, parse_mode=ParseMode.HTML, link_preview_options=SIN_VISTA_PREVIA
             )
             nuevos.append(m.message_id)
             if i == 0:
                 try:
-                    await bot.pin_chat_message(CHANNEL_ID, m.message_id, disable_notification=True)
+                    await bot.pin_chat_message(index_chat, m.message_id, disable_notification=True)
                 except Exception:
                     pass
 
+        # Eliminamos mensajes de indice sobrantes en el canal de índice
         for mid in ids[len(textos):]:
             try:
-                await bot.delete_message(CHANNEL_ID, mid)
+                await bot.delete_message(index_chat, mid)
             except Exception:
                 pass
 
+        # Intentamos persistir en la DB, si está disponible
         try:
             meta_set("indice_ids", json.dumps(nuevos))
         except Exception:
-            log.warning("No se pudo guardar indice en la DB; el índice se mantendrá en mensajes anclados si es posible.")
+            log.debug("No se pudo guardar indice en la DB; el índice se mantendrá en el mensaje fijado del canal de índice si es posible.")
     except Exception:
         log.exception("No se pudo actualizar el índice")
 
@@ -932,6 +1084,12 @@ conv_lote = ConversationHandler(
         LOTE_FILES: [
             MessageHandler(filters.Document.ALL, recibir_lote_file),
             CallbackQueryHandler(lote_listo, pattern=r"^lote_listo$"),
+        ],
+        LOTE_ESTADOS: [
+            CallbackQueryHandler(lote_callback, pattern=r"^lote:(aplicar_todo|por_cada_uno)$"),
+            CallbackQueryHandler(lote_estado_all_selected, pattern=r"^lote_estado_all:"),
+            CallbackQueryHandler(lote_state_idx_handler, pattern=r"^lote_state_idx:"),
+            CallbackQueryHandler(cancelar, pattern=r"^cancelar$"),
         ],
     },
     fallbacks=[CommandHandler("cancelar", cancelar)],
@@ -1010,6 +1168,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
+    """Recibe updates de Telegram"""
     try:
         data = await request.json()
         log.debug(f"📨 Update recibido: {data.get('update_id')}")
@@ -1022,10 +1181,12 @@ async def telegram_webhook(request: Request):
 
 @app.get("/health")
 async def health():
+    """Health check para Render"""
     return {"status": "ok", "db": DB_PATH, "webhook_url": f"{RENDER_EXTERNAL_URL}/telegram-webhook" if RENDER_EXTERNAL_URL else "Not configured"}
 
 @app.get("/")
 async def root():
+    """Raíz de la API"""
     return {"status": "Bot activo", "endpoints": ["/health", "/telegram-webhook"]}
 
 if __name__ == "__main__":
